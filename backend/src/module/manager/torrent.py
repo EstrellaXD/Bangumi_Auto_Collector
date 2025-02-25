@@ -1,179 +1,197 @@
+import asyncio
 import logging
 
-from module.database import Database
-from module.downloader import DownloadClient
-from module.models import Bangumi, BangumiUpdate, ResponseModel
-from module.parser import TitleParser
+from module.database import Database, engine
+from module.downloader import Client as DownlondClient
+from module.manager.renamer import Renamer
+from module.models import Bangumi, BangumiUpdate
+from module.parser import TmdbParser
 
 logger = logging.getLogger(__name__)
 
 
-class TorrentManager(Database):
+class TorrentManager:
+    def __init__(self) -> None:
+        self.tmdb_parser = TmdbParser()
+
     @staticmethod
-    def __match_torrents_list(data: Bangumi | BangumiUpdate) -> list:
-        with DownloadClient() as client:
-            torrents = client.get_torrent_info(status_filter=None)
+    async def __match_torrents_list(data: Bangumi | BangumiUpdate) -> list[str]:
+        """find torrent save in same path
+
+        Args:
+            data: [TODO:description]
+
+        Returns:
+            [
+        """
+        async with DownlondClient:
+            torrents = await DownlondClient.get_torrent_info(status_filter=None)
         return [
-            torrent.hash for torrent in torrents if torrent.save_path == data.save_path
+            torrent["hash"]
+            for torrent in torrents
+            if torrent["save_path"] == data.save_path
         ]
 
-    def delete_torrents(self, data: Bangumi, client: DownloadClient):
-        hash_list = self.__match_torrents_list(data)
-        if hash_list:
-            client.delete_torrent(hash_list)
-            logger.info(f"Delete rule and torrents for {data.official_title}")
-            return ResponseModel(
-                status_code=200,
-                status=True,
-                msg_en=f"Delete rule and torrents for {data.official_title}",
-                msg_zh=f"删除 {data.official_title} 规则和种子",
-            )
-        else:
-            return ResponseModel(
-                status_code=406,
-                status=False,
-                msg_en=f"Can't find torrents for {data.official_title}",
-                msg_zh=f"无法找到 {data.official_title} 的种子",
-            )
+    async def delete_torrents(self, data: Bangumi) -> bool:
+        """删除和 bangumi 相同路径的种子
 
-    def delete_rule(self, _id: int | str, file: bool = False):
-        data = self.bangumi.search_id(int(_id))
-        if isinstance(data, Bangumi):
-            with DownloadClient() as client:
-                self.rss.delete(data.official_title)
-                self.bangumi.delete_one(int(_id))
+        Args:
+            data: Bangumi
+
+        Returns:
+            [TODO:return]
+        """
+        # 删除 bangumi
+        async with DownlondClient:
+            data.save_path = DownlondClient._path_parser.gen_save_path(data)
+            hash_list = await self.__match_torrents_list(data)
+            if hash_list:
+                res = await DownlondClient.delete_torrent(hash_list)
+                if res:
+                    with Database() as database:
+                        for _hash in hash_list:
+                            if torrent_item := database.torrent.search_hash(_hash):
+                                database.torrent.delete(torrent_item.id)
+
+                logger.info(f"Delete rule and torrents for {data.official_title}")
+                return True
+            else:
+                return False
+
+    async def delete_rule(self, _id: int | str, file: bool = False):
+        with Database(engine) as db:
+            data = db.bangumi.search_id(int(_id))
+        if data:
+            async with DownlondClient:
+                with Database(engine) as db:
+                    db.bangumi.delete_one(int(_id))
+                    # 当 bangumi 不是聚合的时候删除 rss
+                    rss_item = db.bangumi_to_rss(data)
+                    if rss_item and rss_item.aggregate is False:
+                        db.rss.delete(rss_item.id)
                 if file:
-                    torrent_message = self.delete_torrents(data, client)
+                    await self.delete_torrents(data)
                 logger.info(f"[Manager] Delete rule for {data.official_title}")
-                return ResponseModel(
-                    status_code=200,
-                    status=True,
-                    msg_en=f"Delete rule for {data.official_title}. {torrent_message.msg_en if file else ''}",
-                    msg_zh=f"删除 {data.official_title} 规则。{torrent_message.msg_zh if file else ''}",
-                )
-        else:
-            return ResponseModel(
-                status_code=406,
-                status=False,
-                msg_en=f"Can't find id {_id}",
-                msg_zh=f"无法找到 id {_id}",
-            )
+            return data
+        return None
 
-    def disable_rule(self, _id: str | int, file: bool = False):
-        data = self.bangumi.search_id(int(_id))
+    async def disable_rule(self, _id: str | int, file: bool = False) -> bool:
+        with Database() as db:
+            data = db.bangumi.search_id(int(_id))
         if isinstance(data, Bangumi):
-            with DownloadClient() as client:
+            async with DownlondClient:
                 # client.remove_rule(data.rule_name)
                 data.deleted = True
-                self.bangumi.update(data)
+                db.bangumi.update(data)
                 if file:
-                    torrent_message = self.delete_torrents(data, client)
+                    torrent_message = await self.delete_torrents(data)
                     return torrent_message
                 logger.info(f"[Manager] Disable rule for {data.official_title}")
-                return ResponseModel(
-                    status_code=200,
-                    status=True,
-                    msg_en=f"Disable rule for {data.official_title}",
-                    msg_zh=f"禁用 {data.official_title} 规则",
+                return True
+        else:
+            return False
+
+    async def enable_rule(self, _id: str | int):
+
+        with Database() as db:
+            data = db.bangumi.search_id(int(_id))
+            if data:
+                data.deleted = False
+                db.bangumi.update(data)
+                logger.info(f"[Manager] Enable rule for {data.official_title}")
+                return True
+            else:
+                return False
+
+    async def rename(self, save_path: str, hash_list: list[str]):
+        renamer = Renamer()
+        renamer_task = []
+        async with DownlondClient:
+            for torrent_hash in hash_list:
+
+                file_contents = await renamer.get_torrent_files(torrent_hash)
+                renamer_task.append(
+                    renamer.rename_files(
+                        torrent_hash,
+                        files_path=file_contents,
+                        save_path=save_path,
+                    )
                 )
-        else:
-            return ResponseModel(
-                status_code=406,
-                status=False,
-                msg_en=f"Can't find id {_id}",
-                msg_zh=f"无法找到 id {_id}",
-            )
+            await asyncio.gather(*renamer_task)
 
-    def enable_rule(self, _id: str | int):
-        data = self.bangumi.search_id(int(_id))
-        if data:
-            data.deleted = False
-            self.bangumi.update(data)
-            logger.info(f"[Manager] Enable rule for {data.official_title}")
-            return ResponseModel(
-                status_code=200,
-                status=True,
-                msg_en=f"Enable rule for {data.official_title}",
-                msg_zh=f"启用 {data.official_title} 规则",
-            )
-        else:
-            return ResponseModel(
-                status_code=406,
-                status=False,
-                msg_en=f"Can't find id {_id}",
-                msg_zh=f"无法找到 id {_id}",
-            )
+    async def update_rule(self, bangumi_id: int, data: BangumiUpdate):
+        with Database() as db:
+            old_data: Bangumi | None = db.bangumi.search_id(bangumi_id)
+            if old_data:
+                # 当只改Filter,offset的时候只改database
+                if (
+                    old_data.official_title != data.official_title
+                    or old_data.year != data.year
+                    or old_data.season != data.season
+                ):
+                    # 名字改了, 年份改了, 季改了
+                    # 名字改的时候,刷新一下海报
+                    if old_data.official_title != data.official_title:
+                        await self.tmdb_parser.poster_parser(data)
+                    # Move torrent
+                    async with DownlondClient:
+                        old_data.save_path = DownlondClient._path_parser.gen_save_path(
+                            old_data
+                        )
+                        hash_list = await self.__match_torrents_list(old_data)
+                        new_save_path = DownlondClient._path_parser.gen_save_path(data)
 
-    def update_rule(self, bangumi_id, data: BangumiUpdate):
-        old_data: Bangumi = self.bangumi.search_id(bangumi_id)
-        if old_data:
-            # Move torrent
-            match_list = self.__match_torrents_list(old_data)
-            with DownloadClient() as client:
-                path = client._gen_save_path(data)
-                if match_list:
-                    client.move_torrent(match_list, path)
-            data.save_path = path
-            self.bangumi.update(data, bangumi_id)
-            return ResponseModel(
-                status_code=200,
-                status=True,
-                msg_en=f"Update rule for {data.official_title}",
-                msg_zh=f"更新 {data.official_title} 规则",
-            )
-        else:
-            logger.error(f"[Manager] Can't find data with {bangumi_id}")
-            return ResponseModel(
-                status_code=406,
-                status=False,
-                msg_en=f"Can't find data with {bangumi_id}",
-                msg_zh=f"无法找到 id {bangumi_id} 的数据",
-            )
+                        if hash_list:
+                            await DownlondClient.move_torrent(hash_list, new_save_path)
+                        # save_path改动后名命名一次
+                        await self.rename(new_save_path, hash_list)
+                        await asyncio.sleep(1)
 
-    def refresh_poster(self):
-        bangumis = self.bangumi.search_all()
-        for bangumi in bangumis:
-            if not bangumi.poster_link:
-                TitleParser().tmdb_poster_parser(bangumi)
-        self.bangumi.update_all(bangumis)
-        return ResponseModel(
-            status_code=200,
-            status=True,
-            msg_en="Refresh poster link successfully.",
-            msg_zh="刷新海报链接成功。",
-        )
 
-    def refind_poster(self, bangumi_id: int):
-        bangumi = self.bangumi.search_id(bangumi_id)
-        TitleParser().tmdb_poster_parser(bangumi)
-        self.bangumi.update(bangumi)
-        return ResponseModel(
-            status_code=200,
-            status=True,
-            msg_en="Refresh poster link successfully.",
-            msg_zh="刷新海报链接成功。",
-        )
+                db.bangumi.update(data, bangumi_id)
+                return True
+            else:
+                logger.error(f"[Manager] Can't find data with {bangumi_id}")
+                return False
+
+    async def refresh_poster(self):
+        with Database() as db:
+            bangumis = db.bangumi.search_all()
+            tasks = []
+            for bangumi in bangumis:
+                if not bangumi.poster_link:
+                    tasks.append(self.tmdb_parser.poster_parser(bangumi))
+            await asyncio.gather(*tasks)
+            db.bangumi.update_all(bangumis)
+        return True
+
+    async def refind_poster(self, bangumi_id: int) -> bool:
+        with Database() as db:
+            bangumi = db.bangumi.search_id(bangumi_id)
+            if bangumi:
+                await self.tmdb_parser.poster_parser(bangumi)
+                db.bangumi.update(bangumi)
+                return True
+        return False
 
     def search_all_bangumi(self):
-        datas = self.bangumi.search_all()
-        if not datas:
-            return []
-        return [data for data in datas if not data.deleted]
+        with Database() as db:
+            datas = db.bangumi.search_all()
+            if not datas:
+                return []
+            return [data for data in datas if not data.deleted]
 
     def search_one(self, _id: int | str):
-        data = self.bangumi.search_id(int(_id))
-        if not data:
-            logger.error(f"[Manager] Can't find data with {_id}")
-            return ResponseModel(
-                status_code=406,
-                status=False,
-                msg_en=f"Can't find data with {_id}",
-                msg_zh=f"无法找到 id {_id} 的数据",
-            )
-        else:
-            return data
+
+        with Database() as db:
+            data = db.bangumi.search_id(int(_id))
+            if not data:
+                logger.error(f"[Manager] Can't find data with {_id}")
+                return None
+            else:
+                return data
 
 
 if __name__ == "__main__":
-    with TorrentManager() as manager:
-        manager.refresh_poster()
+    manager = TorrentManager()
+    asyncio.run(manager.refresh_poster())

@@ -1,38 +1,40 @@
 import logging
 
 from module.models import Notification
-from module.network import RequestContent
-from module.utils import load_image
+from module.network import RequestContent, load_image
+
+from .base_notifier import Notifier as BaseNotifier
 
 logger = logging.getLogger(__name__)
 
 
-class TelegramNotification(RequestContent):
-    def __init__(self, token, chat_id):
-        super().__init__()
-        self.photo_url = f"https://api.telegram.org/bot{token}/sendPhoto"
-        self.message_url = f"https://api.telegram.org/bot{token}/sendMessage"
-        self.chat_id = chat_id
+class Notifier(BaseNotifier):
+    def __init__(self, token: str, chat_id: str):
+        self.photo_url: str = f"https://api.telegram.org/bot{token}/sendPhoto"
+        self.message_url: str = f"https://api.telegram.org/bot{token}/sendMessage"
+        self.chat_id: str = chat_id
 
-    @staticmethod
-    def gen_message(notify: Notification) -> str:
-        text = f"""
-        番剧名称：{notify.official_title}\n季度： 第{notify.season}季\n更新集数： 第{notify.episode}集
-        """
-        return text.strip()
+    def gen_message(self, notify: Notification):
+        # notify.message+="\nhello"
+        pass
 
-    def post_msg(self, notify: Notification) -> bool:
-        text = self.gen_message(notify)
+    async def post_msg(self, notify: Notification) -> bool:
+        self.gen_message(notify)
         data = {
             "chat_id": self.chat_id,
-            "caption": text,
-            "text": text,
+            "caption": notify.message,
+            "text": notify.message,
             "disable_notification": True,
         }
-        photo = load_image(notify.poster_path)
+        photo = None
+        if notify.poster_path:
+            photo = await load_image(notify.poster_path)
+
         if photo:
-            resp = self.post_files(self.photo_url, data, files={"photo": photo})
+            async with RequestContent() as req:
+                resp = await req.post_data(self.photo_url, data, files={"photo": photo})
         else:
-            resp = self.post_data(self.message_url, data)
+            async with RequestContent() as req:
+                resp = await req.post_data(self.message_url, data)
         logger.debug(f"Telegram notification: {resp.status_code}")
-        return resp.status_code == 200
+        return resp and resp.status_code == 200

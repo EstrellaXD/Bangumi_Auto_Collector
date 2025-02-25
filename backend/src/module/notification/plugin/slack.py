@@ -2,26 +2,29 @@ import logging
 
 from module.models import Notification
 from module.network import RequestContent
+from module.utils.cache_image import str_to_url
+
+from .base_notifier import Notifier as BaseNotifier
 
 logger = logging.getLogger(__name__)
 
 
-class SlackNotification(RequestContent):
+class Notifier(BaseNotifier):
     def __init__(self, token, **kwargs):
         super().__init__()
         self.token = token
         self.notification_url = "https://api.day.app/push"
 
     @staticmethod
-    def gen_message(notify: Notification) -> str:
-        text = f"""
-        番剧名称：{notify.official_title}\n季度： 第{notify.season}季\n更新集数： 第{notify.episode}集\n{notify.poster_path}\n
-        """
-        return text.strip()
+    def gen_message(notify: Notification):
+        if notify.episode:
+            if notify.poster_path:
+                notify.poster_path = str_to_url(notify.poster_path.split("/")[-1])
 
-    def post_msg(self, notify: Notification) -> bool:
-        text = self.gen_message(notify)
-        data = {"title": notify.official_title, "body": text, "device_key": self.token}
-        resp = self.post_data(self.notification_url, data)
-        logger.debug(f"Bark notification: {resp.status_code}")
-        return resp.status_code == 200
+    async def post_msg(self, notify: Notification) -> bool:
+        self.gen_message(notify)
+        data = {"title": notify.title, "body": notify.message, "device_key": self.token}
+        async with RequestContent() as req:
+            resp = await req.post_data(self.notification_url, data)
+            logger.debug(f"Bark notification: {resp.status_code}")
+            return resp.status_code == 200

@@ -1,13 +1,15 @@
 import logging
 import os
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from module.api import v1
+from module.api import lifespan, v1
 from module.conf import VERSION, settings, setup_logger
+from module.network import load_image
 
 setup_logger(reset=True)
 logger = logging.getLogger(__name__)
@@ -27,7 +29,7 @@ uvicorn_logging_config = {
 
 
 def create_app() -> FastAPI:
-    app = FastAPI()
+    app = FastAPI(lifespan=lifespan)
 
     # mount routers
     app.include_router(v1, prefix="/api")
@@ -39,8 +41,12 @@ app = create_app()
 
 
 @app.get("/posters/{path:path}", tags=["posters"])
-def posters(path: str):
-    return FileResponse(f"data/posters/{path}")
+async def posters(path: str):
+    # TODO: 由于只有取的时候才会下载,所以会导致第一次请求的时候没有图片
+    post_path = Path("data/posters") / path
+    if not post_path.exists():
+        await load_image(path)
+    return FileResponse(post_path)
 
 
 if VERSION != "DEV_VERSION":

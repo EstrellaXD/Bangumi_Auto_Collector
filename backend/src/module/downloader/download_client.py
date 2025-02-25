@@ -1,85 +1,233 @@
-import logging
 import asyncio
+import importlib
+import logging
+from asyncio import Task
+from typing import Any
 
-from module.conf import settings
-from module.models import Bangumi, Torrent
+from module.models import Torrent
 from module.network import RequestContent
+from module.utils import get_hash, torrent_to_link
 
+from ..conf import settings
+from .client import AuthorizationError, BaseDownloader
 from .path import TorrentPath
 
 logger = logging.getLogger(__name__)
 
 
-def getClient():
-    # TODO 多下载器支持
-    if settings.downloader.type == "qbittorrent":
-        from .client.qb_downloader import QbDownloader
+class DownloadClient:
+    """
+    下载器客户端
+    处理所有下载器相关操作, 对错误进行重试, 不对外暴露错误,看起来是正常运行
+    """
 
-        return QbDownloader
-    elif type == "transmission":
-        from .client.tr_downloader import TrDownloader
-
-        return TrDownloader
-    else:
-        logger.error(f"[Downloader] Unsupported downloader type: {type}")
-        raise Exception(f"Unsupported downloader type: {type}")
-
-
-class DownloadClient(getClient(), TorrentPath):
     def __init__(self):
-        super().__init__(
-            host=settings.downloader.host,
-            username=settings.downloader.username,
-            password=settings.downloader.password,
-            ssl=settings.downloader.ssl,
-        )
+        self.downloader: BaseDownloader = self.get_downloader()
+        self._path_parser: TorrentPath = TorrentPath()
+        self.is_logining: bool = False
+        self.is_running: bool = True
+        # 用于等待登陆完成
+        self.is_login: bool = False
+        self.login_event: asyncio.Event = asyncio.Event()
+        self.login_success_event: asyncio.Event = asyncio.Event()
+        self.login_timeout = 30  # 登录超时时间(秒)
+        self.login_task: asyncio.Task | None = None
+
+    async def __aenter__(self):
+        if not self.is_login:
+            self.login_event.set()
+        # if not self.is_logining:
+        if not self.login_task or self.login_task.done():
+            self.start_login()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        pass
+
+    async def login(self):
+        # 当没有登陆,并且没有登陆事件时
+        try:
+            self.is_logining = True
+            times = 0
+            while True:
+                logger.debug("[Downloader Client] login")
+                await self.login_event.wait()
+                self.login_success_event.clear()
+                if await self.downloader.auth():
+                    self.login_success_event.set()
+                    self.login_event.clear()
+                    self.is_login = True
+                    logger.info("[Downloader Client] login success")
+                else:
+                    times += 1
+                    # 最大为 5 分钟
+                    if times > 10:
+                        times = 10
+                    logger.info(
+                        f"[Downloader Client] login failed, retry after {30*times}s"
+                    )
+                    await asyncio.sleep(times * 30)
+        except Exception as e:
+            logger.error(f"[Downloader Client] login error: {e}")
+            self.is_logining = False
+
+    async def wait_for_login(self) -> bool:
+        """等待登录完成，超时返回False"""
+        try:
+            await asyncio.wait_for(self.login_success_event.wait(), self.login_timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("[Downloader Client] Login wait timeout")
+            raise AuthorizationError("login")
 
     async def get_torrent_info(
-        self, category="Bangumi", status_filter="completed", tag=None
+        self, category="Bangumi", status_filter="completed", tag=None, limit=0
     ):
-        return await self.torrents_info(
-            status_filter=status_filter, category=category, tag=tag
-        )
+        try:
+            await self.wait_for_login()
+            resp = await self.downloader.torrents_info(
+                category=category,
+                status_filter=status_filter,
+                tag=tag,
+                limit=limit,
+            )
+            return resp
+        except AuthorizationError:
+            self.start_login()
+            return []
 
-    async def rename_torrent_file(self, _hash, old_path, new_path) -> bool:
-        logger.info(f"{old_path} >> {new_path}")
-        return await self.rename(
-            torrent_hash=_hash, old_path=old_path, new_path=new_path
-        )
-
-    async def delete_torrent(self, hashes):
-        resp = await self.delete(hashes)
-        logger.info("[Downloader] Remove torrents.")
-        return resp
-
-    async def add_torrents(self, torrents: list[Torrent], bangumi: Bangumi) -> bool:
-        if not bangumi.save_path:
-            bangumi.save_path = self._gen_save_path(bangumi)
-        async with RequestContent() as req:
-            if "magnet" in torrents[0].url:
-                torrent_url = [t.url for t in torrents]
-                torrent_file = None
+    async def add_torrent(self, torrent: Torrent, bangumi) -> bool:
+        try:
+            await self.wait_for_login()
+            bangumi.save_path = self._path_parser.gen_save_path(bangumi)
+            torrent_file = None
+            torrent_url = torrent.url
+            if torrent.url.startswith("magnet"):
+                torrent_url = torrent.url
             else:
-                tasks = []
-                for t in torrents:
-                    tasks.append(req.get_content(t.url))
-                torrent_file = asyncio.gather(*tasks)
-                torrent_url = None
-        result = await self.add(
-            torrent_urls=torrent_url,
-            torrent_files=torrent_file,
-            save_path=bangumi.save_path,
-            category="Bangumi",
-        )
-        if result:
-            logger.debug(f"[Downloader] Add torrent: {bangumi.official_title}")
-            return True
-        else:
-            logger.debug(f"[Downloader] Torrent added before: {bangumi.official_title}")
+                async with RequestContent() as req:
+                    # 下载种子文件,处理 hash 与 url 不一致的情况
+                    if torrent_file := await req.get_content(torrent.url):
+                        torrent_url_hash = get_hash(torrent_url)
+                        torrent_url = await torrent_to_link(torrent_file)
+                        torrent_hash = get_hash(torrent_url)
+                        if torrent_hash != torrent_url_hash:
+                            torrent.url = f"{torrent.url},{torrent_hash}"
+            logging.debug(f"[Downloader] send url {torrent_url}to downloader ")
+
+            result = await self.downloader.add(
+                torrent_urls=torrent_url,
+                torrent_files=torrent_file,
+                save_path=bangumi.save_path,
+                category="Bangumi",
+            )
+            if result:
+                logger.debug(f"[Downloader] Add torrent: {torrent.name}")
+                return True
+            else:
+                logger.warning(
+                    f"[Downloader] Torrent added failed: {torrent.name},{torrent.url=}"
+                )
+        except AuthorizationError:
+            self.start_login()
+        return False
+
+    async def move_torrent(self, hashes: list[str] | str, location: str) -> bool:
+        try:
+            await self.wait_for_login()
+            result = await self.downloader.move(hashes=hashes, new_location=location)
+            if result:
+                logger.info(f"[Downloader] Move torrents {hashes} to {location}")
+                return True
+            else:
+                logger.warning(
+                    f"[Downloader] Move torrents {hashes} to {location} failed"
+                )
+                return False
+        except AuthorizationError:
+            self.start_login()
+        return False
+
+    # async def set_category(self, hashes, category):
+    #     await self.downloader.set_category(hashes, category)
+
+    async def rename_torrent_file(
+        self, torrent_hash: str, old_path: str, new_path: str
+    ) -> bool:
+        try:
+            await self.wait_for_login()
+            result = await self.downloader.rename(
+                torrent_hash=torrent_hash,
+                old_path=old_path,
+                new_path=new_path,
+            )
+            if result:
+                logger.info(f"[Downloader] rename {old_path} >> {new_path}")
+                return True
+            else:
+                logger.warning(f"[Downloader] rename {old_path} >> {new_path} failed")
+                return False
+        except AuthorizationError:
+            self.start_login()
+        return False
+
+    async def delete_torrent(self, hashes: list[str] | str) -> bool:
+        try:
+            await self.wait_for_login()
+            result = await self.downloader.delete(hashes)
+            if result:
+                logger.debug(f"[Downloader] Remove torrents {hashes}.")
+                return True
+            else:
+                logger.warning(f"[Downloader] Remove torrents {hashes} failed")
+                return False
+        except AuthorizationError:
+            self.start_login()
+        return False
+
+    async def get_torrent_files(self, _hash: str) -> list[str]:
+        # 获取种子文件列表
+        # 文件夹举例
+        # LKSUB][Make Heroine ga Oosugiru!][01-12][720P]/[LKSUB][Make Heroine ga Oosugiru!][01][720P].mp4
+        try:
+            await self.wait_for_login()
+            return await self.downloader.get_torrent_files(_hash)
+        except AuthorizationError:
+            self.start_login()
+        return []
+
+    def start_login(self):
+        self.is_login = False
+        self.login_event.set()
+        if not self.login_task or self.login_task.done():
+            self.login_task = asyncio.create_task(self.login(), name="login")
+
+    def start(self):
+        self.downloader = self.get_downloader()
+        # 判断有没有 login task
+        self.start_login()
+
+    async def stop(self):
+        await self.downloader.logout()
+        if self.login_task:
+            self.login_task.cancel()
+
+    async def restart(self):
+        await self.stop()
+        self.start()
+
+    def get_downloader(self) -> BaseDownloader:
+        download_type = settings.downloader.type
+        package_path = f".client.{download_type}"
+        downloader = importlib.import_module(package_path, package=__package__)
+        return downloader.Downloader()
+
+    async def check_host(self) -> bool:
+        try:
+            return await self.downloader.check_host()
+        except AuthorizationError:
+            self.start_login()
             return False
 
-    async def move_torrent(self, hashes, location):
-        await self.move(hashes=hashes, new_location=location)
 
-    async def set_category(self, hashes, category):
-        await self.set_category(hashes, category)
+Client = DownloadClient()
